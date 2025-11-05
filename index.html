@@ -1,22 +1,18 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="fr">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>🎯 Lottery EV Calculator</title>
+  <title>Lottery EV Calculator v2 Enhanced</title>
   <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
-  <style>
-    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif; }
-  </style>
 </head>
 <body>
   <div id="root"></div>
-
   <script type="text/babel">
-    const { useState, useEffect, useMemo } = React;
+    const { useMemo, useState } = React;
 
     // ---- RNG helpers for Monte Carlo ----
     function randn() {
@@ -55,482 +51,788 @@
       return binomialSample(n, K / N);
     }
 
-    function getByPath(obj, path) {
-      return path.split('.').reduce((current, key) => current?.[key], obj);
-    }
+// Lottery EV Calculator – single-file React app v2 Enhanced
+// - TailwindCSS for styling
+// - No external deps
+// - Supports 1 bonus pool (with B bonus draws) and arbitrary prize ranks (exact or range constraints)
+// - EV formula (pari-mutuel, fixed purses shared among winners):
+//   EV(N) = [Σ_r Purse_r * (1 - (1 - p_r)^N)] / N  (+ optional weekly airdrop per-ticket)
+// - p_r = P(exactly k main matches AND s bonus matches) with hypergeometric draws
+// - Includes: expected winners per rank, per-ticket probabilities, rank contributions, break-even solver, airdrop
+// - NEW: Data feeds, BNB mode, "My tickets" section, presets, EV0 breakdown
 
-    function setByPath(obj, path, value) {
-      const keys = path.split('.');
-      const lastKey = keys.pop();
-      const target = keys.reduce((current, key) => {
-        if (current[key] === undefined) current[key] = {};
-        return current[key];
-      }, obj);
-      target[lastKey] = value;
-    }
+// ---------- helpers ----------
+function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+function fmt(n, d = 2) { return isFinite(n) ? n.toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d }) : "–"; }
+function fmt0(n) { return isFinite(n) ? n.toLocaleString() : "–"; }
 
-    function NumberInput({ label, value, onChange, step = 1, disabled }) {
-      return (
-        <div className="flex flex-col space-y-1">
-          <label className="text-xs text-slate-400">{label}</label>
-          <input
-            type="number"
-            className="px-3 py-2 rounded-xl bg-slate-800 border border-slate-700 text-slate-100 disabled:opacity-50"
-            value={value || 0}
-            onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
-            step={step}
-            disabled={disabled}
-          />
+function choose(n, k) {
+  if (k < 0 || k > n) return 0;
+  k = Math.min(k, n - k);
+  let num = 1, den = 1;
+  for (let i = 1; i <= k; i++) {
+    num *= (n - (k - i));
+    den *= i;
+  }
+  return num / den;
+}
+
+// Hypergeometric probability: drawing drawCount items without replacement from poolSize,
+// probability of exactly m matches when you have picked pickCount target items
+function hypergeomExact(poolSize, pickCount, drawCount, m) {
+  // P = [C(pickCount, m) * C(poolSize - pickCount, drawCount - m)] / C(poolSize, drawCount)
+  if (m < 0 || m > pickCount || m > drawCount) return 0;
+  const top = choose(pickCount, m) * choose(poolSize - pickCount, drawCount - m);
+  const bottom = choose(poolSize, drawCount);
+  return bottom > 0 ? top / bottom : 0;
+}
+
+function sumRange(lo, hi, f) {
+  let s = 0;
+  for (let i = lo; i <= hi; i++) s += f(i);
+  return s;
+}
+
+// dot-path extractor for JSON feeds (e.g., "data.price.usd")
+function getByPath(obj, path) {
+  if (!path) return obj;
+  return String(path).split('.').reduce((acc, key) => (acc && typeof acc === 'object') ? acc[key] : undefined, obj);
+}
+
+// ---------- default model (Euromillions-like variant the user asked for) ----------
+const defaultModel = {
+  ticketPrice: 0.0813392,
+  totalTickets: 143088,
+  main: { poolSize: 50, drawCount: 5 },
+  bonus: { poolSize: 9, drawCount: 1 }, // can set drawCount > 1 if more than one bonus is drawn
+  weeklyAirdrop: { enabled: true, tokenAmount: 5_000_000, tokenUsdPrice: 0.0995, weeklyTickets: 143088 },
+  // Ranks: each row defines constraints and a fixed purse (USD) to be shared among winners
+  // mode: "exact" means exactly X; "range" means min..max inclusive
+  ranks: [
+    { id: "5+1", name: "5 + 1 bonus", mainMode: "exact", mainExact: 5, bonusMode: "exact", bonusExact: 1, purseUsd: 106290.75, enabled: true },
+    { id: "5+0", name: "5 + 0 bonus", mainMode: "exact", mainExact: 5, bonusMode: "exact", bonusExact: 0, purseUsd: 10629.08, enabled: true },
+    { id: "4+1", name: "4 + 1 bonus", mainMode: "exact", mainExact: 4, bonusMode: "exact", bonusExact: 1, purseUsd: 5314.54, enabled: true },
+    { id: "4+0", name: "4 + 0 bonus", mainMode: "exact", mainExact: 4, bonusMode: "exact", bonusExact: 0, purseUsd: 7086.05, enabled: true },
+    { id: "3+1", name: "3 + 1 bonus", mainMode: "exact", mainExact: 3, bonusMode: "exact", bonusExact: 1, purseUsd: 10629.08, enabled: true },
+    { id: "3+0", name: "3 + 0 bonus", mainMode: "exact", mainExact: 3, bonusMode: "exact", bonusExact: 0, purseUsd: 15943.61, enabled: true },
+    { id: "2+1", name: "2 + 1 bonus", mainMode: "exact", mainExact: 2, bonusMode: "exact", bonusExact: 1, purseUsd: 21258.15, enabled: true },
+  ],
+};
+
+function useLottery(model) {
+  const {
+    ticketPrice,
+    totalTickets: N,
+    main: { poolSize: nMain, drawCount: mMain },
+    bonus: { poolSize: nBonus, drawCount: mBonus },
+    weeklyAirdrop,
+    ranks,
+  } = model;
+
+  // per-rank probability p_r and expected winners
+  const perRankAll = useMemo(() => {
+    return ranks.map(r => {
+      const pMain = r.mainMode === "exact"
+        ? hypergeomExact(nMain, mMain, mMain, r.mainExact)
+        : sumRange(r.mainMin ?? 0, r.mainMax ?? mMain, (k) => hypergeomExact(nMain, mMain, mMain, k));
+
+      const pBonus = mBonus > 0
+        ? (r.bonusMode === "exact"
+            ? hypergeomExact(nBonus, mBonus, mBonus, r.bonusExact)
+            : sumRange(r.bonusMin ?? 0, r.bonusMax ?? mBonus, (s) => hypergeomExact(nBonus, mBonus, mBonus, s)))
+        : (r.bonusMode === "exact" ? (r.bonusExact === 0 ? 1 : 0) : 1);
+
+      const p = pMain * pBonus;
+      const expectedWinners = N * p;
+      const probAtLeastOneWinner = 1 - Math.pow(1 - p, N);
+      const contributionPerTicket = (r.purseUsd * probAtLeastOneWinner) / N;
+      return { r, p, expectedWinners, probAtLeastOneWinner, contributionPerTicket };
+    });
+  }, [ranks, N, nMain, mMain, nBonus, mBonus]);
+
+  const perRank = useMemo(() => perRankAll.filter(x => x.r.enabled), [perRankAll]);
+
+  const evPurses = useMemo(() => perRank.reduce((s, x) => s + x.contributionPerTicket, 0), [perRank]);
+
+  const evAirdropPerTicket = useMemo(() => {
+    if (!weeklyAirdrop?.enabled) return 0;
+    const tokens = Math.max(0, Number(weeklyAirdrop.tokenAmount) || 0);
+    const price = Math.max(0, Number(weeklyAirdrop.tokenUsdPrice) || 0);
+    const total = tokens * price; // USD airdropped this week
+    const denom = Math.max(1, Number(weeklyAirdrop.weeklyTickets) || N);
+    return total / denom;
+  }, [weeklyAirdrop, N]);
+
+  const evPerTicket = evPurses + evAirdropPerTicket;
+  const evNetPerTicket = evPerTicket - ticketPrice;
+  const roi = evPerTicket / ticketPrice;
+
+  // Solve for break-even N* (ignoring airdrop or optionally include)
+  function breakEven(includeAirdrop) {
+    const maxN = 5_000_000; // search bound
+    const minN = 1;
+    function evAt(Nx) {
+      // recompute contributions at Nx (keeping per-rank p same because p depends on structure, not N)
+      let s = 0;
+      for (const x of perRank) {
+        const p = x.p;
+        const prob = 1 - Math.pow(1 - p, Nx);
+        s += (x.r.purseUsd * prob) / Nx;
+      }
+      if (includeAirdrop) {
+        const tokens = Math.max(0, Number(weeklyAirdrop.tokenAmount) || 0);
+        const price = Math.max(0, Number(weeklyAirdrop.tokenUsdPrice) || 0);
+        const total = tokens * price;
+        const denom = Math.max(1, Number(weeklyAirdrop.weeklyTickets) || Nx);
+        s += total / denom;
+      }
+      return s;
+    }
+    if (evAt(maxN) > model.ticketPrice) return null; // still EV+ within bounds
+    let lo = minN, hi = maxN;
+    while (hi - lo > 1) {
+      const mid = Math.floor((lo + hi) / 2);
+      const e = evAt(mid);
+      if (e > model.ticketPrice) lo = mid; else hi = mid;
+    }
+    return hi;
+  }
+
+  const nStarNoAirdrop = useMemo(() => breakEven(false), [perRank, weeklyAirdrop, model.ticketPrice]);
+  const nStarWithAirdrop = useMemo(() => breakEven(true), [perRank, weeklyAirdrop, model.ticketPrice]);
+
+  return { perRank, perRankAll, evPurses, evAirdropPerTicket, evPerTicket, evNetPerTicket, roi, nStarNoAirdrop, nStarWithAirdrop };
+}
+
+function NumberInput({ label, value, onChange, step = 1, min = 0, className = "" }) {
+  return (
+    <label className={`flex flex-col gap-1 ${className}`}>
+      <span className="text-xs text-slate-400">{label}</span>
+      <input type="number" step={step} min={min} value={value}
+        onChange={e => onChange(Number(e.target.value))}
+        className="px-3 py-2 rounded-xl bg-slate-800/60 border border-slate-700 text-slate-100 focus:outline-none" />
+    </label>
+  );
+}
+
+function TextInput({ label, value, onChange, placeholder = "", className = "" }) {
+  return (
+    <label className={`flex flex-col gap-1 ${className}`}>
+      <span className="text-xs text-slate-400">{label}</span>
+      <input type="text" value={value} placeholder={placeholder}
+        onChange={e => onChange(e.target.value)}
+        className="px-3 py-2 rounded-xl bg-slate-800/60 border border-slate-700 text-slate-100 focus:outline-none" />
+    </label>
+  );
+}
+
+function Switch({ label, checked, onChange }) {
+  return (
+    <div className="flex items-center gap-3">
+      <button onClick={() => onChange(!checked)}
+        className={`w-12 h-7 rounded-full p-1 transition ${checked ? "bg-emerald-500/80" : "bg-slate-600"}`}>
+        <div className={`h-5 w-5 rounded-full bg-white transition ${checked ? "translate-x-5" : "translate-x-0"}`} />
+      </button>
+      <span className="text-sm text-slate-300">{label}</span>
+    </div>
+  );
+}
+
+function RankRow({ r, mMain, mBonus, onChange, onRemove }) {
+  const update = (patch) => onChange({ ...r, ...patch });
+  return (
+    <div className="grid grid-cols-12 gap-2 items-end p-3 rounded-2xl bg-slate-900/60 border border-slate-800">
+      <input className="col-span-2 px-3 py-2 rounded-xl bg-slate-800/60 border border-slate-700 text-slate-100"
+             value={r.name} onChange={e => update({ name: e.target.value })} />
+
+      <div className="col-span-3 grid grid-cols-3 gap-2">
+        <select value={r.mainMode} onChange={e => update({ mainMode: e.target.value })}
+          className="col-span-1 px-2 py-2 rounded-xl bg-slate-800/60 border border-slate-700 text-slate-100">
+          <option value="exact">main =</option>
+          <option value="range">main min..max</option>
+        </select>
+        {r.mainMode === "exact" ? (
+          <NumberInput className="col-span-2" label={`Main (0..${mMain})`} value={r.mainExact}
+            onChange={v => update({ mainExact: clamp(v, 0, mMain) })} />
+        ) : (
+          <>
+            <NumberInput label={`Main min`} value={r.mainMin ?? 0} onChange={v => update({ mainMin: clamp(v, 0, mMain) })} />
+            <NumberInput label={`Main max`} value={r.mainMax ?? mMain} onChange={v => update({ mainMax: clamp(v, 0, mMain) })} />
+          </>
+        )}
+      </div>
+
+      <div className="col-span-3 grid grid-cols-3 gap-2">
+        <select value={r.bonusMode} onChange={e => update({ bonusMode: e.target.value })}
+          className="col-span-1 px-2 py-2 rounded-xl bg-slate-800/60 border border-slate-700 text-slate-100">
+          <option value="exact">bonus =</option>
+          <option value="range">bonus min..max</option>
+        </select>
+        {r.bonusMode === "exact" ? (
+          <NumberInput className="col-span-2" label={`Bonus (0..${mBonus})`} value={r.bonusExact}
+            onChange={v => update({ bonusExact: clamp(v, 0, mBonus) })} />
+        ) : (
+          <>
+            <NumberInput label={`Bonus min`} value={r.bonusMin ?? 0} onChange={v => update({ bonusMin: clamp(v, 0, mBonus) })} />
+            <NumberInput label={`Bonus max`} value={r.bonusMax ?? mBonus} onChange={v => update({ bonusMax: clamp(v, 0, mBonus) })} />
+          </>
+        )}
+      </div>
+
+      <NumberInput className="col-span-2" label="Purse (USD)" value={r.purseUsd}
+        onChange={v => update({ purseUsd: Math.max(0, v) })} step={0.01} />
+
+      <div className="col-span-1 flex items-center justify-center">
+        <Switch label="" checked={r.enabled} onChange={(c) => update({ enabled: c })} />
+      </div>
+
+      <div className="col-span-1 flex justify-end">
+        <button className="px-3 py-2 rounded-xl bg-rose-700/70 hover:bg-rose-700 text-white" onClick={onRemove}>✕</button>
+      </div>
+    </div>
+  );
+}
+
+function LotteryEVApp() {
+  const [model, setModel] = useState(defaultModel);
+  // Pricing mode: USD or BNB → we always compute an effective USD price for EV math
+  const [priceMode, setPriceMode] = useState('USD');
+  const [ticketPriceBNB, setTicketPriceBNB] = useState(0.0000888);
+  const [bnbUsd, setBnbUsd] = useState(948.4); // default from CoinGecko snapshot; editable in UI
+  const [myTickets, setMyTickets] = useState(100);
+  const [tab, setTab] = useState('PARAM'); // 'PARAM' | 'STATS' | 'SIM'
+
+  // Monte Carlo sim state
+  const [simTrials, setSimTrials]   = useState(10000);
+  const [simResults, setSimResults] = useState(null);
+  const [simRunning, setSimRunning] = useState(false);
+
+  // ---- Data feeds (URLs, JSON paths, last fetched values) ----
+  const [feed, setFeed] = useState({
+    bnb:   { url: "", path: "", last: null, error: null },
+    lucky: { url: "", path: "", last: null, error: null },
+    tokens:{ url: "", path: "", last: null, error: null },
+    weekly:{ url: "", path: "", last: null, error: null },
+    model: { url: "" }
+  });
+  function updateFeedField(key, patch) {
+    setFeed(f => ({ ...f, [key]: { ...f[key], ...patch } }));
+  }
+  async function fetchApplyNumber(key, apply) {
+    try {
+      if (!feed[key].url) return updateFeedField(key, { error: "URL manquante" });
+      const res = await fetch(feed[key].url);
+      const json = await res.json();
+      const val = getByPath(json, feed[key].path);
+      if (typeof val === 'number' && isFinite(val)) {
+        apply(val);
+        updateFeedField(key, { last: val, error: null });
+      } else {
+        updateFeedField(key, { error: "La clé ne pointe pas vers un nombre", last: null });
+      }
+    } catch (e) {
+      updateFeedField(key, { error: String(e), last: null });
+    }
+  }
+  async function loadModelFromUrl() {
+    try {
+      if (!feed.model.url) return;
+      const res = await fetch(feed.model.url);
+      const json = await res.json();
+      setModel(json);
+    } catch (e) {
+      alert("Échec du chargement: " + String(e));
+    }
+  }
+
+  // Compute effective ticket price in USD depending on mode
+  const effectiveTicketPrice = priceMode === 'USD' ? model.ticketPrice : (ticketPriceBNB * bnbUsd);
+  const derivedModel = { ...model, ticketPrice: effectiveTicketPrice };
+  const { perRank, perRankAll, evPurses, evAirdropPerTicket, evPerTicket, evNetPerTicket, roi, nStarNoAirdrop, nStarWithAirdrop } = useLottery(derivedModel);
+
+  // Break-even (airdrop-only): weeklyTickets* such that airdrop per ticket == ticket price
+  const airdropBreakEvenWeeklyTickets = React.useMemo(() => {
+    const tokens = Math.max(0, model.weeklyAirdrop?.tokenAmount || 0);
+    const tokenUsd = Math.max(0, model.weeklyAirdrop?.tokenUsdPrice || 0);
+    const totalUsd = tokens * tokenUsd;
+    const priceT = derivedModel.ticketPrice;
+    if (totalUsd <= 0 || priceT <= 0) return null;
+    return Math.ceil(totalUsd / priceT);
+  }, [model.weeklyAirdrop, derivedModel.ticketPrice]);
+
+  const airdropCoverage = derivedModel.ticketPrice > 0 ? (evAirdropPerTicket / derivedModel.ticketPrice) : 0;
+
+  // My tickets summary (what I get if I buy X tickets)
+  const myPursesUsd = myTickets * evPurses;
+  const myAirdropUsd = myTickets * evAirdropPerTicket;
+  const myEV = myTickets * evPerTicket;
+  const myCost = myTickets * effectiveTicketPrice;
+  const myNet = myEV - myCost;
+  const myROI = myEV / myCost;
+
+  // Scenario computations: impact of excluding top ranks for myTickets
+  const baseKeepIds = useMemo(() => model.ranks.filter(r => r.enabled).map(r => r.id), [model.ranks]);
+  const evPursesForKeep = (keepIds) => {
+    const set = new Set(keepIds);
+    let s = 0;
+    for (const x of perRankAll) {
+      if (!set.has(x.r.id)) continue;
+      const prob = 1 - Math.pow(1 - x.p, model.totalTickets);
+      s += (x.r.purseUsd * prob) / model.totalTickets;
+    }
+    return s;
+  };
+  const scenarioDefs = [
+    { label: 'Tous les rangs', exclude: [] },
+    { label: 'Sans 5+1', exclude: ['5+1'] },
+    { label: 'Sans 5+1 & 5+0', exclude: ['5+1','5+0'] },
+    { label: 'Sans 5+1..4+0', exclude: ['5+1','5+0','4+1','4+0'] },
+  ];
+  const scenarioRows = useMemo(() => {
+    const rows = scenarioDefs.map(d => {
+      const keep = baseKeepIds.filter(id => !d.exclude.includes(id));
+      const evP = evPursesForKeep(keep);
+      const myPurses = myTickets * evP;
+      return { ...d, myPurses };
+    });
+    return rows;
+  }, [scenarioDefs, baseKeepIds, perRankAll, model.totalTickets, myTickets]);
+  const baselinePurses = scenarioRows[0]?.myPurses ?? 0;
+
+  const totalPurse = useMemo(() => model.ranks.filter(r => r.enabled).reduce((s, r) => s + r.purseUsd, 0), [model]);
+  const anyWinProb = useMemo(() => perRank.reduce((s, x) => s + x.p, 0), [perRank]);
+
+  function updateModel(patch) { setModel(m => ({ ...m, ...patch })); }
+
+  function addRank() {
+    const k = model.ranks.length;
+    const newRank = { id: `custom-${k+1}`, name: `Custom ${k+1}`, mainMode: "exact", mainExact: 2, bonusMode: "exact", bonusExact: 0, purseUsd: 1000, enabled: true };
+    updateModel({ ranks: [...model.ranks, newRank] });
+  }
+
+  function removeRank(idx) {
+    const arr = [...model.ranks];
+    arr.splice(idx, 1);
+    updateModel({ ranks: arr });
+  }
+
+  function updateRank(idx, newRank) {
+    const arr = [...model.ranks];
+    arr[idx] = newRank;
+    updateModel({ ranks: arr });
+  }
+
+  // === Presets to quickly include/exclude prize ranks ===
+  function setRanksEnabledByIds(keepIds) {
+    const set = new Set(keepIds);
+    updateModel({ ranks: model.ranks.map(r => ({ ...r, enabled: set.has(r.id) })) });
+  }
+  function applyPreset(code) {
+    const allIds = model.ranks.map(r => r.id);
+    const exclude = (ids) => allIds.filter(id => !ids.includes(id));
+    let keep;
+    switch (code) {
+      case 'ALL':
+        keep = allIds; break;
+      case 'NO_TOP1':
+        keep = exclude(['5+1']); break;
+      case 'NO_TOP2':
+        keep = exclude(['5+1','5+0']); break;
+      case 'NO_TOP4':
+        keep = exclude(['5+1','5+0','4+1','4+0']); break;
+      case 'BOTTOM3':
+        // Keep only lower three standard ranks if present; keep custom ranks too? here only the three.
+        keep = allIds.filter(id => ['3+1','3+0','2+1'].includes(id));
+        break;
+      default:
+        keep = allIds;
+    }
+    setRanksEnabledByIds(keep);
+  }
+
+  function exportConfig() {
+    const blob = new Blob([JSON.stringify(model, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "lottery-ev-config.json"; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function importConfig(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try { const obj = JSON.parse(String(reader.result)); setModel(obj); } catch (err) { alert("Invalid JSON"); }
+    };
+    reader.readAsText(file);
+  }
+
+  const airdropUsd = (model.weeklyAirdrop?.tokenAmount || 0) * (model.weeklyAirdrop?.tokenUsdPrice || 0);
+
+  // --- Monte Carlo simulation of ROI thresholds ---
+  const roiThresholds = [-0.05, -0.10, -0.20, -0.30, -0.50, 0]; // -5%, -10%, ...
+  function runSimulation() {
+    try {
+      setSimRunning(true);
+      const N = model.totalTickets;
+      const X = myTickets;
+      const pList    = perRank.map(x => x.p);
+      const purseUsd = perRank.map(x => x.r.purseUsd);
+      const trials   = Math.max(1, Math.floor(simTrials));
+      const price    = derivedModel.ticketPrice;
+      const dropPT   = evAirdropPerTicket;
+
+      const counts = Object.fromEntries(roiThresholds.map(th => [th, 0]));
+      for (let t = 0; t < trials; t++) {
+        let remainingN = N, remainingX = X, remP = 1.0, payout = 0;
+        for (let i = 0; i < pList.length; i++) {
+          const pr = pList[i];
+          const adjusted = remP > 0 ? (pr / remP) : 0;           // multinomiale séquentielle
+          const wTot = binomialSample(remainingN, adjusted);     // gagnants totaux à ce rang
+          const wMe  = hypergeomSample(remainingN, wTot, remainingX); // parmi MES X
+          remainingN -= wTot; remainingX -= wMe; remP -= pr;
+          if (wTot > 0 && wMe > 0) payout += wMe * (purseUsd[i] / wTot); // partage pari-mutuel
+        }
+        payout += X * dropPT;                      // airdrop
+        const cost = X * price;
+        const roi  = (payout - cost) / cost;       // ex: -0.05 = -5%
+        for (const th of roiThresholds) if (roi <= th) counts[th]++;
+      }
+      const probs = Object.fromEntries(roiThresholds.map(th => [th, counts[th] / trials]));
+      setSimResults({ trials, probs });
+    } finally { setSimRunning(false); }
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-slate-100 p-6">
+      <div className="max-w-7xl mx-auto space-y-6">
+        <header className="flex items-center justify-between">
+          <h1 className="text-2xl font-semibold">🎯 Lottery EV Calculator</h1>
+          <div className="flex gap-2">
+            <label className="text-sm px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 cursor-pointer">Import config JSON
+              <input type="file" className="hidden" accept="application/json" onChange={importConfig} />
+            </label>
+            <button className="text-sm px-3 py-2 rounded-xl bg-slate-900 border border-slate-700" onClick={exportConfig}>Export config</button>
+          </div>
+        </header>
+
+        {/* Tabs */}
+        <div className="flex gap-2 mb-2">
+          {[
+            { id: 'PARAM', label: 'Paramétrage' },
+            { id: 'STATS', label: 'Stats' },
+            { id: 'SIM',   label: 'Simulation' },
+          ].map(t => (
+            <button
+              key={t.id}
+              onClick={() => setTab(t.id)}
+              className={`px-3 py-2 rounded-xl border ${tab===t.id ? 'bg-emerald-600/20 border-emerald-500' : 'bg-slate-900 border-slate-700'}`}
+            >
+              {t.label}
+            </button>
+          ))}
         </div>
-      );
-    }
 
-    function fmt(x, decimals = 2) { return Number(x).toFixed(decimals); }
-    function fmt0(x) { return Number(x).toFixed(0); }
-
-    function LotteryEVApp() {
-      const [tab, setTab] = useState('PARAM'); // 'PARAM' | 'STATS' | 'SIM'
-      const [model, setModel] = useState({
-        totalTickets: 1000000,
-        ticketPrice: 1.5,
-        bnbPrice: 650,
-        prizePool: { percentage: 50 },
-        weeklyAirdrop: { tokenAmount: 50000, tokenUsdPrice: 0.50 },
-        drawConfig: { mainNumbers: 5, bonusNumbers: 1 },
-        ranks: [
-          { exact: [5, 1], pursePercentage: 50 },
-          { exact: [5, 0], pursePercentage: 20 },
-          { exact: [4, 1], pursePercentage: 10 },
-          { exact: [4, 0], pursePercentage: 8 },
-          { exact: [3, 1], pursePercentage: 5 },
-          { exact: [3, 0], pursePercentage: 3 },
-          { exact: [2, 1], pursePercentage: 2 },
-          { exact: [1, 1], pursePercentage: 1.5 },
-          { exact: [0, 1], pursePercentage: 0.5 },
-        ]
-      });
-
-      const [priceMode, setPriceMode] = useState('USD');
-      const [myTickets, setMyTickets] = useState(100);
-
-      // Monte Carlo sim state
-      const [simTrials, setSimTrials]   = useState(10000);
-      const [simResults, setSimResults] = useState(null);
-      const [simRunning, setSimRunning] = useState(false);
-
-      const updateModel = (updates) => setModel(prev => ({ ...prev, ...updates }));
-
-      const updateRank = (index, field, value) => {
-        const newRanks = [...model.ranks];
-        setByPath(newRanks[index], field, value);
-        updateModel({ ranks: newRanks });
-      };
-
-      const addRank = () => {
-        const newRanks = [...model.ranks, { exact: [0, 0], pursePercentage: 1 }];
-        updateModel({ ranks: newRanks });
-      };
-
-      const removeRank = (index) => {
-        const newRanks = model.ranks.filter((_, i) => i !== index);
-        updateModel({ ranks: newRanks });
-      };
-
-      const derivedModel = useMemo(() => {
-        const ticketPrice = priceMode === 'BNB' ? (model.ticketPrice || 0) * (model.bnbPrice || 1) : (model.ticketPrice || 0);
-        const totalRevenue = (model.totalTickets || 0) * ticketPrice;
-        const prizePool = totalRevenue * ((model.prizePool?.percentage || 0) / 100);
-        const mainPool = 50, bonusPool = 9;
-        const mainNumbers = model.drawConfig?.mainNumbers || 5;
-        const bonusNumbers = model.drawConfig?.bonusNumbers || 1;
-
-        function combination(n, k) {
-          if (k > n || k < 0) return 0;
-          if (k === 0 || k === n) return 1;
-          k = Math.min(k, n - k);
-          let result = 1;
-          for (let i = 0; i < k; i++) {
-            result = result * (n - i) / (i + 1);
-          }
-          return result;
-        }
-
-        function hypergeometric(N, K, n, k) {
-          if (k > n || k > K || (n - k) > (N - K)) return 0;
-          return (combination(K, k) * combination(N - K, n - k)) / combination(N, n);
-        }
-
-        const ranksWithProbs = (model.ranks || []).map(rank => {
-          const [mainHits, bonusHits] = rank.exact || [0, 0];
-          const mainMisses = mainNumbers - mainHits;
-          const bonusMisses = bonusNumbers - bonusHits;
-          
-          const probMain = hypergeometric(mainPool, mainNumbers, mainNumbers, mainHits);
-          const probBonus = hypergeometric(bonusPool, bonusNumbers, bonusNumbers, bonusHits);
-          const combinedProb = probMain * probBonus;
-          
-          return {
-            ...rank,
-            probability: combinedProb,
-            purseUsd: prizePool * ((rank.pursePercentage || 0) / 100)
-          };
-        });
-
-        const totalEV = ranksWithProbs.reduce((sum, rank) => sum + rank.probability * rank.purseUsd, 0);
-
-        return {
-          ticketPrice,
-          totalRevenue,
-          prizePool,
-          ranksWithProbs,
-          evPerTicket: totalEV
-        };
-      }, [model, priceMode]);
-
-      const evAirdropPerTicket = useMemo(() => {
-        const airdropUsd = (model.weeklyAirdrop?.tokenAmount || 0) * (model.weeklyAirdrop?.tokenUsdPrice || 0);
-        const totalTickets = model.totalTickets || 1;
-        return airdropUsd / totalTickets;
-      }, [model.weeklyAirdrop, model.totalTickets]);
-
-      const perRank = derivedModel.ranksWithProbs.map(r => ({ p: r.probability, r }));
-      const roi = ((derivedModel.evPerTicket + evAirdropPerTicket) - derivedModel.ticketPrice) / derivedModel.ticketPrice;
-
-      const exportConfig = () => {
-        const blob = new Blob([JSON.stringify(model, null, 2)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'lottery-config.json';
-        a.click();
-        URL.revokeObjectURL(url);
-      };
-
-      const importConfig = (event) => {
-        const file = event.target.files[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          try { const obj = JSON.parse(String(reader.result)); setModel(obj); } catch (err) { alert("Invalid JSON"); }
-        };
-        reader.readAsText(file);
-      }
-
-      const airdropUsd = (model.weeklyAirdrop?.tokenAmount || 0) * (model.weeklyAirdrop?.tokenUsdPrice || 0);
-
-      const anyWinProb = useMemo(() => perRank.reduce((s, x) => s + x.p, 0), [perRank]);
-
-      // --- Monte Carlo simulation of ROI thresholds ---
-      const roiThresholds = [-0.05, -0.10, -0.20, -0.30, -0.50, 0]; // -5%, -10%, ...
-      function runSimulation() {
-        try {
-          setSimRunning(true);
-          const N = model.totalTickets;
-          const X = myTickets;
-          const pList    = perRank.map(x => x.p);
-          const purseUsd = perRank.map(x => x.r.purseUsd);
-          const trials   = Math.max(1, Math.floor(simTrials));
-          const price    = derivedModel.ticketPrice;
-          const dropPT   = evAirdropPerTicket;
-
-          const counts = Object.fromEntries(roiThresholds.map(th => [th, 0]));
-          for (let t = 0; t < trials; t++) {
-            let remainingN = N, remainingX = X, remP = 1.0, payout = 0;
-            for (let i = 0; i < pList.length; i++) {
-              const pr = pList[i];
-              const adjusted = remP > 0 ? (pr / remP) : 0;           // multinomiale séquentielle
-              const wTot = binomialSample(remainingN, adjusted);     // gagnants totaux à ce rang
-              const wMe  = hypergeomSample(remainingN, wTot, remainingX); // parmi MES X
-              remainingN -= wTot; remainingX -= wMe; remP -= pr;
-              if (wTot > 0 && wMe > 0) payout += wMe * (purseUsd[i] / wTot); // partage pari-mutuel
-            }
-            payout += X * dropPT;                      // airdrop
-            const cost = X * price;
-            const roi  = (payout - cost) / cost;       // ex: -0.05 = -5%
-            for (const th of roiThresholds) if (roi <= th) counts[th]++;
-          }
-          const probs = Object.fromEntries(roiThresholds.map(th => [th, counts[th] / trials]));
-          setSimResults({ trials, probs });
-        } finally { setSimRunning(false); }
-      }
-
-      return (
-        <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-slate-100 p-6">
-          <div className="max-w-7xl mx-auto space-y-6">
-            <header className="flex items-center justify-between">
-              <h1 className="text-2xl font-semibold">🎯 Lottery EV Calculator</h1>
-              <div className="flex gap-2">
-                <label className="text-sm px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 cursor-pointer">Import config JSON
-                  <input type="file" className="hidden" accept="application/json" onChange={importConfig} />
-                </label>
-                <button className="text-sm px-3 py-2 rounded-xl bg-slate-900 border border-slate-700" onClick={exportConfig}>Export config</button>
+        {tab==='PARAM' && (
+          <>
+        {/* Top controls */}
+        <div className="grid md:grid-cols-3 gap-4">
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-3">
+            <h2 className="text-lg font-medium">🎟️ Ticket & volumes</h2>
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 text-sm">
+                <button className={`px-2 py-1 rounded-lg border ${priceMode==='USD' ? 'bg-emerald-600/20 border-emerald-500' : 'bg-slate-800 border-slate-700'}`} onClick={()=>setPriceMode('USD')}>USD</button>
+                <button className={`px-2 py-1 rounded-lg border ${priceMode==='BNB' ? 'bg-emerald-600/20 border-emerald-500' : 'bg-slate-800 border-slate-700'}`} onClick={()=>setPriceMode('BNB')}>BNB</button>
               </div>
-            </header>
+              {priceMode === 'USD' ? (
+                <NumberInput label="Ticket price ($)" value={model.ticketPrice} onChange={(v) => updateModel({ ticketPrice: Math.max(0, v) })} step={0.0000001} />
+              ) : (
+                <div className="grid grid-cols-2 gap-3">
+                  <NumberInput label="Ticket price (BNB)" value={ticketPriceBNB} onChange={(v)=>setTicketPriceBNB(Math.max(0, v))} step={0.0000001} />
+                  <NumberInput label="BNB price ($)" value={bnbUsd} onChange={(v)=>setBnbUsd(Math.max(0, v))} step={0.01} />
+                  <div className="col-span-2 text-xs text-slate-400">Prix effectif du ticket ≈ ${fmt(ticketPriceBNB * bnbUsd, 6)}</div>
+                </div>
+              )}
+              <NumberInput label="Total tickets (N)" value={model.totalTickets} onChange={(v) => updateModel({ totalTickets: Math.max(1, Math.floor(v)) })} />
+              <div className="text-xs text-slate-400">Mise totale ≈ ${fmt(model.totalTickets * effectiveTicketPrice)}</div>
+            </div>
+          </div>
 
-            {/* Tabs */}
-            <div className="flex gap-2 mb-2">
-              {[
-                { id: 'PARAM', label: 'Paramétrage' },
-                { id: 'STATS', label: 'Stats' },
-                { id: 'SIM',   label: 'Simulation' },
-              ].map(t => (
-                <button
-                  key={t.id}
-                  onClick={() => setTab(t.id)}
-                  className={`px-3 py-2 rounded-xl border ${tab===t.id ? 'bg-emerald-600/20 border-emerald-500' : 'bg-slate-900 border-slate-700'}`}
-                >
-                  {t.label}
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-3">
+            <h2 className="text-lg font-medium">🔢 Draw structure</h2>
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 text-xs">
+                <span className="px-2 py-1 rounded-lg bg-slate-800/70 border border-slate-700">Main pool: 1–50 (fixe)</span>
+                <span className="px-2 py-1 rounded-lg bg-slate-800/70 border border-slate-700">Bonus pool: 1–9 (fixe)</span>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <NumberInput label="Main draw count (k)" value={model.main.drawCount} onChange={(v) => updateModel({ main: { ...model.main, drawCount: Math.max(0, Math.floor(v)) } })} />
+                <NumberInput label="Bonus draw count (B)" value={model.bonus.drawCount} onChange={(v) => updateModel({ bonus: { ...model.bonus, drawCount: Math.max(0, Math.floor(v)) } })} />
+              </div>
+            </div>
+            <p className="text-xs text-slate-400">Probas calculées avec hypergéométrique (tirage sans remise) pour les deux urnes. Les tailles d'urnes sont <b>fixes</b> : 1–50 (main) et 1–9 (bonus).</p>
+          </div>
+
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-3">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-medium">🎁 Weekly airdrop</h2>
+              <Switch label="Enable" checked={model.weeklyAirdrop.enabled}
+                onChange={(c) => updateModel({ weeklyAirdrop: { ...model.weeklyAirdrop, enabled: c } })} />
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              <NumberInput label="Tokens" value={model.weeklyAirdrop.tokenAmount} onChange={(v) => updateModel({ weeklyAirdrop: { ...model.weeklyAirdrop, tokenAmount: Math.max(0, v) } })} />
+              <NumberInput label="Token price ($)" step={0.0001} value={model.weeklyAirdrop.tokenUsdPrice} onChange={(v) => updateModel({ weeklyAirdrop: { ...model.weeklyAirdrop, tokenUsdPrice: Math.max(0, v) } })} />
+              <NumberInput label="Weekly tickets (denom)" value={model.weeklyAirdrop.weeklyTickets} onChange={(v) => updateModel({ weeklyAirdrop: { ...model.weeklyAirdrop, weeklyTickets: Math.max(1, Math.floor(v)) } })} />
+            </div>
+            <div className="text-xs text-slate-400">Airdrop USD ≈ ${fmt(airdropUsd)} → +${fmt((model.weeklyAirdrop.enabled ? airdropUsd / Math.max(1, model.weeklyAirdrop.weeklyTickets) : 0), 6)} / ticket</div>
+          </div>
+        </div>
+
+        {/* Data Feeds (Fetch) */}
+        <section className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-4">
+          <h2 className="text-lg font-medium">📡 Data Feeds (Fetch)</h2>
+          <p className="text-xs text-slate-400">Renseigne une URL JSON + un <i>dot path</i> (ex: <code>data.price</code>) pour mettre à jour automatiquement les variables clés. Idéal pour brancher des pricefeeds / endpoints maison.</p>
+          <div className="grid md:grid-cols-2 gap-4">
+            <div className="p-3 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+              <div className="text-sm font-medium">BNB/USD</div>
+              <TextInput label="URL JSON" value={feed.bnb.url} onChange={(v)=>updateFeedField('bnb',{url:v})} placeholder="https://..." />
+              <TextInput label="Chemin (dot path)" value={feed.bnb.path} onChange={(v)=>updateFeedField('bnb',{path:v})} placeholder="ex: data.price" />
+              <div className="flex items-center gap-2">
+                <button className="px-3 py-2 rounded-xl bg-sky-700/60 hover:bg-sky-700 border border-sky-600" onClick={()=>fetchApplyNumber('bnb', setBnbUsd)}>Fetch & Apply</button>
+                <div className="text-xs text-slate-400">Dernier: {feed.bnb.last ?? '–'} {feed.bnb.error && <span className="text-rose-400">• {String(feed.bnb.error)}</span>}</div>
+              </div>
+            </div>
+
+            <div className="p-3 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+              <div className="text-sm font-medium">LUCKY/USD</div>
+              <TextInput label="URL JSON" value={feed.lucky.url} onChange={(v)=>updateFeedField('lucky',{url:v})} placeholder="https://..." />
+              <TextInput label="Chemin (dot path)" value={feed.lucky.path} onChange={(v)=>updateFeedField('lucky',{path:v})} placeholder="ex: data.price" />
+              <div className="flex items-center gap-2">
+                <button className="px-3 py-2 rounded-xl bg-sky-700/60 hover:bg-sky-700 border border-sky-600" onClick={()=>fetchApplyNumber('lucky', (val)=>updateModel({ weeklyAirdrop: { ...model.weeklyAirdrop, tokenUsdPrice: val } }))}>Fetch & Apply</button>
+                <div className="text-xs text-slate-400">Dernier: {feed.lucky.last ?? '–'} {feed.lucky.error && <span className="text-rose-400">• {String(feed.lucky.error)}</span>}</div>
+              </div>
+            </div>
+
+            <div className="p-3 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+              <div className="text-sm font-medium">LUCKY tokens / semaine</div>
+              <TextInput label="URL JSON" value={feed.tokens.url} onChange={(v)=>updateFeedField('tokens',{url:v})} placeholder="https://..." />
+              <TextInput label="Chemin (dot path)" value={feed.tokens.path} onChange={(v)=>updateFeedField('tokens',{path:v})} placeholder="ex: data.amount" />
+              <div className="flex items-center gap-2">
+                <button className="px-3 py-2 rounded-xl bg-sky-700/60 hover:bg-sky-700 border border-sky-600" onClick={()=>fetchApplyNumber('tokens', (val)=>updateModel({ weeklyAirdrop: { ...model.weeklyAirdrop, tokenAmount: Math.max(0, val) } }))}>Fetch & Apply</button>
+                <div className="text-xs text-slate-400">Dernier: {feed.tokens.last ?? '–'} {feed.tokens.error && <span className="text-rose-400">• {String(feed.tokens.error)}</span>}</div>
+              </div>
+            </div>
+
+            <div className="p-3 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+              <div className="text-sm font-medium">Tickets semaine (denom airdrop)</div>
+              <TextInput label="URL JSON" value={feed.weekly.url} onChange={(v)=>updateFeedField('weekly',{url:v})} placeholder="https://..." />
+              <TextInput label="Chemin (dot path)" value={feed.weekly.path} onChange={(v)=>updateFeedField('weekly',{path:v})} placeholder="ex: data.count" />
+              <div className="flex items-center gap-2">
+                <button className="px-3 py-2 rounded-xl bg-sky-700/60 hover:bg-sky-700 border border-sky-600" onClick={()=>fetchApplyNumber('weekly', (val)=>updateModel({ weeklyAirdrop: { ...model.weeklyAirdrop, weeklyTickets: Math.max(1, Math.floor(val)) } }))}>Fetch & Apply</button>
+                <div className="text-xs text-slate-400">Dernier: {feed.weekly.last ?? '–'} {feed.weekly.error && <span className="text-rose-400">• {String(feed.weekly.error)}</span>}</div>
+              </div>
+            </div>
+          </div>
+
+          <div className="p-3 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+            <div className="text-sm font-medium">Charger un modèle complet (JSON)</div>
+            <TextInput label="URL du model.json" value={feed.model.url} onChange={(v)=>setFeed(f=>({...f, model:{...f.model, url:v}}))} placeholder="https://.../state.json" />
+            <button className="px-3 py-2 rounded-xl bg-emerald-700/60 hover:bg-emerald-700 border border-emerald-600" onClick={loadModelFromUrl}>Load model from URL</button>
+            <div className="text-xs text-slate-400">Le modèle doit suivre la structure affichée dans l'export JSON (ticketPrice/totalTickets/main/bonus/weeklyAirdrop/ranks...).</div>
+          </div>
+        </section>
+
+        {/* Ranks editor */}
+        <section className="space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-medium">🏆 Prize ranks</h2>
+            <div className="flex items-center gap-2 flex-wrap">
+              <button className="px-2 py-1 rounded-lg bg-slate-800 border border-slate-700 hover:bg-slate-700" onClick={() => applyPreset('ALL')}>Tous</button>
+              <button className="px-2 py-1 rounded-lg bg-slate-800 border border-slate-700 hover:bg-slate-700" onClick={() => applyPreset('NO_TOP1')}>Sans 5+1</button>
+              <button className="px-2 py-1 rounded-lg bg-slate-800 border border-slate-700 hover:bg-slate-700" onClick={() => applyPreset('NO_TOP2')}>Sans 5+1 & 5+0</button>
+              <button className="px-2 py-1 rounded-lg bg-slate-800 border border-slate-700 hover:bg-slate-700" onClick={() => applyPreset('NO_TOP4')}>Sans 5+1..4+0</button>
+              <button className="px-2 py-1 rounded-lg bg-slate-800 border border-slate-700 hover:bg-slate-700" onClick={() => applyPreset('BOTTOM3')}>3+1, 3+0, 2+1</button>
+              <button className="px-3 py-2 rounded-xl bg-slate-900 border border-slate-700" onClick={addRank}>+ Add rank</button>
+            </div>
+          </div>
+          <div className="space-y-2">
+            {model.ranks.map((r, i) => (
+              <RankRow key={r.id} r={r} mMain={model.main.drawCount} mBonus={model.bonus.drawCount}
+                onChange={(nr) => updateRank(i, nr)} onRemove={() => removeRank(i)} />
+            ))}
+          </div>
+          <div className="text-xs text-slate-400">Purse = cagnotte fixe à partager (pari-mutuel). Décoche un rang pour l'exclure.
+          </div>
+        </section>
+          </>
+        )}
+
+        {/* Results */}
+        {tab==='STATS' && (
+          <>
+        <section className="grid lg:grid-cols-5 gap-4">
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-2">
+            <h3 className="font-medium">📊 EV & ROI</h3>
+            <div className="text-sm">Prizepool actif (somme des rangs cochés): <b>${fmt(totalPurse)}</b></div>
+            <div className="text-sm">EV (purses) / ticket: <b>${fmt(evPurses, 6)}</b></div>
+            <div className="text-sm">EV (airdrop) / ticket: <b>${fmt(evAirdropPerTicket, 6)}</b></div>
+            <div className="text-sm">EV totale / ticket: <b>${fmt(evPerTicket, 6)}</b></div>
+            <div className="text-sm">EV nette / ticket: <b>${fmt(evNetPerTicket, 6)}</b></div>
+            <div className="text-sm">ROI (= EV / prix): <b>{fmt(roi, 4)}×</b></div>
+          </div>
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-2">
+            <h3 className="font-medium">⚖️ Break-even (EV = prix)</h3>
+            <div className="text-sm">Seuil tickets (hors airdrop): <b>{nStarNoAirdrop ? fmt0(nStarNoAirdrop) : ">5 000 000"}</b></div>
+            <div className="text-sm">Seuil tickets (avec airdrop): <b>{nStarWithAirdrop ? fmt0(nStarWithAirdrop) : ">5 000 000"}</b></div>
+            <div className="text-xs text-slate-400">Si la valeur du token/volume airdrop varie, ce seuil évolue.</div>
+          </div>
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-2">
+            <h3 className="font-medium">🎯 Probas par ticket</h3>
+            <div className="text-xs text-slate-400">P(au moins un prix) = somme des probas exactes des rangs actifs.</div>
+            <div className="text-sm">P(≥ 1 prix) ≈ <b>{fmt(anyWinProb * 100, 6)}%</b></div>
+          </div>
+
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-2">
+            <h3 className="font-medium">🎯 EV0 par composant</h3>
+            <div className="text-sm">Tirage seul (N*) : <b>{nStarNoAirdrop ? fmt0(nStarNoAirdrop) : ">5 000 000"}</b></div>
+            <div className="text-sm">Airdrop seul (weeklyTickets*) : <b>{airdropBreakEvenWeeklyTickets ? fmt0(airdropBreakEvenWeeklyTickets) : '–'}</b></div>
+            <div className="text-xs text-slate-400">Actuel weeklyTickets : {fmt0(model.weeklyAirdrop?.weeklyTickets || 0)} • L'airdrop couvre ~{fmt(airdropCoverage*100, 2)}% du prix ticket.</div>
+          </div>
+
+          {/* Monte Carlo simulation card */}
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-2">
+            <h3 className="font-medium">🎲 Odds vs ROI thresholds</h3>
+            <div className="grid grid-cols-2 gap-3">
+              <NumberInput label="Trials (Monte Carlo)" value={simTrials}
+                onChange={(v)=>setSimTrials(Math.max(100, Math.floor(v)))} />
+              <div className="flex items-end">
+                <button className="px-3 py-2 rounded-xl bg-sky-700/60 hover:bg-sky-700 border border-sky-600 disabled:opacity-50"
+                        disabled={simRunning} onClick={runSimulation}>
+                  {simRunning ? 'Running…' : 'Run simulation'}
                 </button>
-              ))}
-            </div>
-
-            {tab==='PARAM' && (
-              <>
-            {/* Top controls */}
-            <div className="grid md:grid-cols-3 gap-4">
-              <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-3">
-                <h2 className="text-lg font-medium">🎟️ Ticket & volumes</h2>
-                <div className="space-y-3">
-                  <div className="flex items-center gap-2 text-sm">
-                    <button className={`px-2 py-1 rounded-lg border ${priceMode==='USD' ? 'bg-emerald-600/20 border-emerald-500' : 'bg-slate-800 border-slate-700'}`} onClick={()=>setPriceMode('USD')}>USD</button>
-                    <button className={`px-2 py-1 rounded-lg border ${priceMode==='BNB' ? 'bg-emerald-600/20 border-emerald-500' : 'bg-slate-800 border-slate-700'}`} onClick={()=>setPriceMode('BNB')}>BNB</button>
-                  </div>
-                  {priceMode === 'USD' ? (
-                    <NumberInput label="Ticket price ($)" value={model.ticketPrice} onChange={(v) => updateModel({ ticketPrice: Math.max(0, v) })} step={0.0000001} />
-                  ) : (
-                    <>
-                      <NumberInput label="Ticket price (BNB)" value={model.ticketPrice} onChange={(v) => updateModel({ ticketPrice: Math.max(0, v) })} step={0.0000001} />
-                      <NumberInput label="BNB price ($)" value={model.bnbPrice} onChange={(v) => updateModel({ bnbPrice: Math.max(0, v) })} step={0.01} />
-                    </>
-                  )}
-                  <NumberInput label="Total tickets sold" value={model.totalTickets} onChange={(v) => updateModel({ totalTickets: Math.max(1, Math.floor(v)) })} />
-                  <NumberInput label="My tickets" value={myTickets} onChange={(v) => setMyTickets(Math.max(0, Math.floor(v)))} />
-                </div>
-              </div>
-
-              <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-3">
-                <h2 className="text-lg font-medium">🏆 Prize allocation</h2>
-                <div className="space-y-3">
-                  <NumberInput label="Prize pool (%)" value={model.prizePool?.percentage} onChange={(v) => updateModel({ prizePool: { ...model.prizePool, percentage: Math.max(0, Math.min(100, v)) } })} />
-                  <div className="text-xs text-slate-400">
-                    Prize pool: <span className="font-mono text-emerald-400">${fmt(derivedModel.prizePool)}</span>
-                  </div>
-                  <div className="text-xs text-slate-400">
-                    Revenue: <span className="font-mono text-slate-300">${fmt(derivedModel.totalRevenue)}</span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-3">
-                <h2 className="text-lg font-medium">🪂 Weekly airdrop</h2>
-                <div className="space-y-3">
-                  <NumberInput label="Tokens per week" value={model.weeklyAirdrop?.tokenAmount} onChange={(v) => updateModel({ weeklyAirdrop: { ...model.weeklyAirdrop, tokenAmount: Math.max(0, v) } })} />
-                  <NumberInput label="Token USD price" value={model.weeklyAirdrop?.tokenUsdPrice} onChange={(v) => updateModel({ weeklyAirdrop: { ...model.weeklyAirdrop, tokenUsdPrice: Math.max(0, v) } })} step={0.0001} />
-                  <div className="text-xs text-slate-400">
-                    Total airdrop: <span className="font-mono text-purple-400">${fmt(airdropUsd)}</span>
-                  </div>
-                  <div className="text-xs text-slate-400">
-                    Per ticket: <span className="font-mono text-purple-300">${fmt(evAirdropPerTicket, 6)}</span>
-                  </div>
-                </div>
               </div>
             </div>
 
-            {/* Draw configuration */}
-            <section className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-4">
-              <h2 className="text-lg font-medium">🎲 Draw configuration</h2>
-              <div className="grid md:grid-cols-2 gap-4">
-                <NumberInput label="Main numbers to draw" value={model.drawConfig?.mainNumbers} onChange={(v) => updateModel({ drawConfig: { ...model.drawConfig, mainNumbers: Math.max(1, Math.floor(v)) } })} />
-                <NumberInput label="Bonus numbers to draw" value={model.drawConfig?.bonusNumbers} onChange={(v) => updateModel({ drawConfig: { ...model.drawConfig, bonusNumbers: Math.max(0, Math.floor(v)) } })} />
-              </div>
-              <div className="text-xs text-slate-400 space-y-1">
-                <p>Main pool: 1-50 (fixed) • Bonus pool: 1-9 (fixed)</p>
-                <p>Player picks the same amount as drawn numbers</p>
-              </div>
-            </section>
-
-            {/* Ranks configuration */}
-            <section className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-4">
-              <div className="flex items-center justify-between">
-                <h2 className="text-lg font-medium">🏅 Prize ranks</h2>
-                <button className="text-sm px-3 py-1.5 rounded-lg bg-emerald-600/20 border border-emerald-500" onClick={addRank}>+ Add rank</button>
-              </div>
+            {simResults ? (
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-slate-300 border-b border-slate-800">
-                      <th className="text-left py-2">Main hits</th>
-                      <th className="text-left py-2">Bonus hits</th>
-                      <th className="text-left py-2">Purse %</th>
-                      <th className="text-left py-2">Probability</th>
-                      <th className="text-left py-2">Purse USD</th>
-                      <th className="text-left py-2">Contribution</th>
-                      <th className="text-left py-2">Actions</th>
+                      <th className="text-left py-1">Seuil (ROI)</th>
+                      <th className="text-right py-1">P(ROI ≤ seuil)</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {model.ranks.map((rank, index) => {
-                      const derived = derivedModel.ranksWithProbs[index];
-                      return (
-                        <tr key={index} className="border-b border-slate-800/60">
-                          <td className="py-2">
-                            <input
-                              type="number"
-                              className="w-16 px-2 py-1 rounded bg-slate-800 border border-slate-700"
-                              value={rank.exact?.[0] || 0}
-                              onChange={(e) => updateRank(index, 'exact.0', parseInt(e.target.value) || 0)}
-                              min={0}
-                              max={model.drawConfig?.mainNumbers || 5}
-                            />
-                          </td>
-                          <td className="py-2">
-                            <input
-                              type="number"
-                              className="w-16 px-2 py-1 rounded bg-slate-800 border border-slate-700"
-                              value={rank.exact?.[1] || 0}
-                              onChange={(e) => updateRank(index, 'exact.1', parseInt(e.target.value) || 0)}
-                              min={0}
-                              max={model.drawConfig?.bonusNumbers || 1}
-                            />
-                          </td>
-                          <td className="py-2">
-                            <input
-                              type="number"
-                              className="w-20 px-2 py-1 rounded bg-slate-800 border border-slate-700"
-                              value={rank.pursePercentage || 0}
-                              onChange={(e) => updateRank(index, 'pursePercentage', parseFloat(e.target.value) || 0)}
-                              step={0.1}
-                              min={0}
-                              max={100}
-                            />
-                          </td>
-                          <td className="py-2 text-right font-mono">{derived ? fmt(derived.probability * 100, 8) : '0'}%</td>
-                          <td className="py-2 text-right font-mono">${derived ? fmt(derived.purseUsd) : '0'}</td>
-                          <td className="py-2 text-right font-mono">${derived ? fmt(derived.probability * derived.purseUsd, 6) : '0'}</td>
-                          <td className="py-2">
-                            <button className="text-red-400 hover:text-red-300" onClick={() => removeRank(index)}>Remove</button>
-                          </td>
-                        </tr>
-                      );
-                    })}
+                    {roiThresholds.map(th => (
+                      <tr key={th} className="border-b border-slate-800/60">
+                        <td className="py-1">{Math.round(th*100)}%</td>
+                        <td className="py-1 text-right">{fmt((simResults.probs[th] || 0) * 100, 2)}%</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <div className="text-xs text-slate-400 mt-1">
+                  Basé sur {fmt0(simResults.trials)} essais; inclut airdrop et partage pari-mutuel.
+                </div>
+              </div>
+            ) : (
+              <div className="text-xs text-slate-400">
+                Clique « Run simulation » pour estimer les probabilités d'atterrir sous −5%, −10%, −20%, etc.
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* Per-rank table */}
+        <section className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800">
+          <h3 className="font-medium mb-3">📈 Détails par rang (avec N = {fmt0(model.totalTickets)})</h3>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-slate-300 border-b border-slate-800">
+                  <th className="text-left py-2">Rang</th>
+                  <th className="text-right py-2">P(exacte)</th>
+                  <th className="text-right py-2">E[# gagnants]</th>
+                  <th className="text-right py-2">P(≥1 gagnant)</th>
+                  <th className="text-right py-2">Purse ($)</th>
+                  <th className="text-right py-2">Contrib. EV/ticket ($)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {perRank.map(({ r, p, expectedWinners, probAtLeastOneWinner, contributionPerTicket }) => (
+                  <tr key={r.id} className="border-b border-slate-800/60">
+                    <td className="py-2 text-slate-200">{r.name}</td>
+                    <td className="py-2 text-right">{fmt(p * 100, 6)}%</td>
+                    <td className="py-2 text-right">{fmt(expectedWinners, 4)}</td>
+                    <td className="py-2 text-right">{fmt(probAtLeastOneWinner * 100, 4)}%</td>
+                    <td className="py-2 text-right">${fmt(r.purseUsd)}</td>
+                    <td className="py-2 text-right">${fmt(contributionPerTicket, 6)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        {/* Utility notes */}
+        <section className="text-xs text-slate-400 space-y-1">
+          <p>🔌 <b>Live updates</b>: branche un fetch vers tes endpoints (prizepool, ventes, prix du $LUCKY). Par ex. programme un cron/serverless qui alimente un JSON public, puis charge-le ici pour mettre à jour le modèle.</p>
+          <p>🧩 <b>Types de tirage</b> : ajuste uniquement le <i>nombre de tirages</i> (k pour les principaux, B pour le bonus) et configure les rangs (exact/range). Les <b>tailles d'urnes sont fixes</b> : 1–50 (main) et 1–9 (bonus).</p>
+          <p>🧮 <b>Formules</b>: Hypergéométrique pour chaque urne; indépendance entre urnes; EV pari-mutuel à cagnotte fixe partagée.</p>
+        </section>
+          </>
+        )}
+
+        {/* Simulation */}
+        {tab==='SIM' && (
+          <section className="grid lg:grid-cols-2 gap-4">
+            <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-2">
+              <h3 className="font-medium">🧮 Mes tickets</h3>
+              <NumberInput label="Nombre de tickets" value={myTickets} onChange={(v)=>setMyTickets(Math.max(0, Math.floor(v)))} />
+              <div className="text-sm">Si j'achète <b>{fmt0(myTickets)}</b> tickets&nbsp;:</div>
+              <div className="text-sm">— au tirage (purses) ≈ <b>${fmt(myTickets * evPurses, 2)}</b></div>
+              <div className="text-sm">— d'airdrop ≈ <b>${fmt(myTickets * evAirdropPerTicket, 2)}</b></div>
+              <div className="text-sm">Total EV ≈ <b>${fmt(myTickets * (evPurses + evAirdropPerTicket), 2)}</b> • Coût ≈ <b>${fmt(myTickets * derivedModel.ticketPrice, 2)}</b></div>
+              <div className="text-sm">
+                EV nette ≈ <b>${fmt(myTickets * (evPurses + evAirdropPerTicket - derivedModel.ticketPrice), 2)}</b> •
+                ROI ≈ <b>{((evPurses + evAirdropPerTicket) / derivedModel.ticketPrice).toFixed(3)}×</b>
+              </div>
+            </div>
+
+            <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-2">
+              <h3 className="font-medium">📊 Scénarios d'exclusion</h3>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-slate-300 border-b border-slate-800">
+                      <th className="text-left py-1">Scénario</th>
+                      <th className="text-right py-1">Au tirage ($)</th>
+                      <th className="text-right py-1">Δ vs Tous</th>
+                      <th className="text-right py-1">Airdrop ($)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {scenarioRows.map((row) => (
+                      <tr key={row.label} className="border-b border-slate-800/60">
+                        <td className="py-1">{row.label}</td>
+                        <td className="py-1 text-right">${fmt(row.myPurses, 2)}</td>
+                        <td className="py-1 text-right">{(scenarioRows[0]?.myPurses ?? 0) > 0 ? `${fmt(((row.myPurses / scenarioRows[0].myPurses) - 1) * 100, 2)}%` : '–'}</td>
+                        <td className="py-1 text-right">${fmt(myTickets * evAirdropPerTicket, 2)}</td>
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
               </div>
-            </section>
+            </div>
+          </section>
+        )}
+      </div>
+    </div>
+  );
+}
 
-            {/* Utility notes */}
-            <section className="text-xs text-slate-400 space-y-1">
-              <p>🔌 <b>Live updates</b>: branche un fetch vers tes endpoints (prizepool, ventes, prix du $LUCKY). Par ex. programme un cron/serverless qui alimente un JSON public, puis charge-le ici pour mettre à jour le modèle.</p>
-              <p>🧩 <b>Types de tirage</b> : ajuste uniquement le <i>nombre de tirages</i> (k pour les principaux, B pour le bonus) et configure les rangs (exact/range). Les <b>tailles d'urnes sont fixes</b> : 1–50 (main) et 1–9 (bonus).</p>
-              <p>🧮 <b>Formules</b>: Hypergéométrique pour chaque urne; indépendance entre urnes; EV pari-mutuel à cagnotte fixe partagée.</p>
-            </section>
-              </>
-            )}
-
-            {tab==='STATS' && (
-              <>
-            <section className="grid lg:grid-cols-6 gap-4">
-              {/* EV stat */}
-              <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-2">
-                <h3 className="font-medium">💰 Expected value</h3>
-                <div className="text-2xl font-bold text-emerald-400">${fmt(derivedModel.evPerTicket, 6)}</div>
-                <div className="text-xs text-slate-400">Per ticket (pre-airdrop)</div>
-              </div>
-
-              {/* Post-airdrop EV */}
-              <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-2">
-                <h3 className="font-medium">🪂 EV + airdrop</h3>
-                <div className="text-2xl font-bold text-purple-400">${fmt(derivedModel.evPerTicket + evAirdropPerTicket, 6)}</div>
-                <div className="text-xs text-slate-400">Per ticket (includes airdrop)</div>
-              </div>
-
-              {/* ROI */}
-              <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-2">
-                <h3 className="font-medium">📈 ROI</h3>
-                <div className={`text-2xl font-bold ${roi >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                  {roi >= 0 ? '+' : ''}{fmt(roi * 100, 2)}%
-                </div>
-                <div className="text-xs text-slate-400">Return on investment</div>
-              </div>
-
-              {/* Any win prob */}
-              <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-2">
-                <h3 className="font-medium">🎯 Any win prob</h3>
-                <div className="text-2xl font-bold text-sky-400">{fmt(anyWinProb * 100, 6)}%</div>
-                <div className="text-xs text-slate-400">P(any rank)</div>
-              </div>
-
-              {/* Expected wins */}
-              <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-2">
-                <h3 className="font-medium">🏆 Expected wins</h3>
-                <div className="text-2xl font-bold text-orange-400">{fmt(myTickets * anyWinProb, 4)}</div>
-                <div className="text-xs text-slate-400">With {myTickets} tickets</div>
-              </div>
-
-              {/* Monte Carlo simulation card */}
-              <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-2">
-                <h3 className="font-medium">🎲 Odds vs ROI thresholds</h3>
-                <div className="grid grid-cols-2 gap-3">
-                  <NumberInput label="Trials (Monte Carlo)" value={simTrials}
-                    onChange={(v)=>setSimTrials(Math.max(100, Math.floor(v)))} />
-                  <div className="flex items-end">
-                    <button className="px-3 py-2 rounded-xl bg-sky-700/60 hover:bg-sky-700 border border-sky-600 disabled:opacity-50"
-                            disabled={simRunning} onClick={runSimulation}>
-                      {simRunning ? 'Running…' : 'Run simulation'}
-                    </button>
-                  </div>
-                </div>
-
-                {simResults ? (
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-sm">
-                      <thead>
-                        <tr className="text-slate-300 border-b border-slate-800">
-                          <th className="text-left py-1">Seuil (ROI)</th>
-                          <th className="text-right py-1">P(ROI ≤ seuil)</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {roiThresholds.map(th => (
-                          <tr key={th} className="border-b border-slate-800/60">
-                            <td className="py-1">{Math.round(th*100)}%</td>
-                            <td className="py-1 text-right">{fmt((simResults.probs[th] || 0) * 100, 2)}%</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                    <div className="text-xs text-slate-400 mt-1">
-                      Basé sur {fmt0(simResults.trials)} essais; inclut airdrop et partage pari-mutuel.
-                    </div>
-                  </div>
-                ) : (
-                  <div className="text-xs text-slate-400">
-                    Clique « Run simulation » pour estimer les probabilités d'atterrir sous −5%, −10%, −20%, etc.
-                  </div>
-                )}
-              </div>
-            </section>
-              </>
-            )}
-
-            {tab==='SIM' && (
-              <>
-            <p className="text-slate-400">Simulation tab content would go here.</p>
-              </>
-            )}
-
-            {/* Utility notes */}
-            <section className="text-xs text-slate-400 space-y-1">
-              <p>🔌 <b>Live updates</b>: branche un fetch vers tes endpoints (prizepool, ventes, prix du $LUCKY). Par ex. programme un cron/serverless qui alimente un JSON public, puis charge-le ici pour mettre à jour le modèle.</p>
-              <p>🧩 <b>Types de tirage</b> : ajuste uniquement le <i>nombre de tirages</i> (k pour les principaux, B pour le bonus) et configure les rangs (exact/range). Les <b>tailles d'urnes sont fixes</b> : 1–50 (main) et 1–9 (bonus).</p>
-              <p>🧮 <b>Formules</b>: Hypergéométrique pour chaque urne; indépendance entre urnes; EV pari-mutuel à cagnotte fixe partagée.</p>
-            </section>
-          </div>
-        </div>
-      );
-    }
-
-        ReactDOM.render(<LotteryEVApp />, document.getElementById('root'));
-      </script>
-    </body>
-    </html>
+    ReactDOM.render(<LotteryEVApp />, document.getElementById('root'));
+  </script>
+</body>
+</html>
