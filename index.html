@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lottery EV Calculator</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useMemo, useState } = React;
+
+// Lottery EV Calculator – single-file React app
+// - TailwindCSS for styling
+// - No external deps
+// - Supports 1 bonus pool (with B bonus draws) and arbitrary prize ranks (exact or range constraints)
+// - EV formula (pari-mutuel, fixed purses shared among winners):
+//   EV(N) = [Σ_r Purse_r * (1 - (1 - p_r)^N)] / N  (+ optional weekly airdrop per-ticket)
+// - p_r = P(exactly k main matches AND s bonus matches) with hypergeometric draws
+// - Includes: expected winners per rank, per-ticket probabilities, rank contributions, break-even solver, airdrop
+
+// ---------- helpers ----------
+function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+function fmt(n, d = 2) { return isFinite(n) ? n.toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d }) : "–"; }
+function fmt0(n) { return isFinite(n) ? n.toLocaleString() : "–"; }
+
+function choose(n, k) {
+  if (k < 0 || k > n) return 0;
+  k = Math.min(k, n - k);
+  let num = 1, den = 1;
+  for (let i = 1; i <= k; i++) {
+    num *= (n - (k - i));
+    den *= i;
+  }
+  return num / den;
+}
+
+// Hypergeometric probability: drawing drawCount items without replacement from poolSize,
+// probability of exactly m matches when you have picked pickCount target items
+function hypergeomExact(poolSize, pickCount, drawCount, m) {
+  // P = [C(pickCount, m) * C(poolSize - pickCount, drawCount - m)] / C(poolSize, drawCount)
+  if (m < 0 || m > pickCount || m > drawCount) return 0;
+  const top = choose(pickCount, m) * choose(poolSize - pickCount, drawCount - m);
+  const bottom = choose(poolSize, drawCount);
+  return bottom > 0 ? top / bottom : 0;
+}
+
+function sumRange(lo, hi, f) {
+  let s = 0;
+  for (let i = lo; i <= hi; i++) s += f(i);
+  return s;
+}
+
+// ---------- default model (Euromillions-like variant the user asked for) ----------
+const defaultModel = {
+  ticketPrice: 0.0813392,
+  totalTickets: 143088,
+  main: { poolSize: 50, drawCount: 5 },
+  bonus: { poolSize: 9, drawCount: 1 }, // can set drawCount > 1 if more than one bonus is drawn
+  weeklyAirdrop: { enabled: true, tokenAmount: 5_000_000, tokenUsdPrice: 0.0995, weeklyTickets: 143088 },
+  // Ranks: each row defines constraints and a fixed purse (USD) to be shared among winners
+  // mode: "exact" means exactly X; "range" means min..max inclusive
+  ranks: [
+    { id: "5+1", name: "5 + 1 bonus", mainMode: "exact", mainExact: 5, bonusMode: "exact", bonusExact: 1, purseUsd: 106290.75, enabled: true },
+    { id: "5+0", name: "5 + 0 bonus", mainMode: "exact", mainExact: 5, bonusMode: "exact", bonusExact: 0, purseUsd: 10629.08, enabled: true },
+    { id: "4+1", name: "4 + 1 bonus", mainMode: "exact", mainExact: 4, bonusMode: "exact", bonusExact: 1, purseUsd: 5314.54, enabled: true },
+    { id: "4+0", name: "4 + 0 bonus", mainMode: "exact", mainExact: 4, bonusMode: "exact", bonusExact: 0, purseUsd: 7086.05, enabled: true },
+    { id: "3+1", name: "3 + 1 bonus", mainMode: "exact", mainExact: 3, bonusMode: "exact", bonusExact: 1, purseUsd: 10629.08, enabled: true },
+    { id: "3+0", name: "3 + 0 bonus", mainMode: "exact", mainExact: 3, bonusMode: "exact", bonusExact: 0, purseUsd: 15943.61, enabled: true },
+    { id: "2+1", name: "2 + 1 bonus", mainMode: "exact", mainExact: 2, bonusMode: "exact", bonusExact: 1, purseUsd: 21258.15, enabled: true },
+  ],
+};
+
+function useLottery(model) {
+  const {
+    ticketPrice,
+    totalTickets: N,
+    main: { poolSize: nMain, drawCount: mMain },
+    bonus: { poolSize: nBonus, drawCount: mBonus },
+    weeklyAirdrop,
+    ranks,
+  } = model;
+
+  // per-rank probability p_r and expected winners
+  const perRank = useMemo(() => {
+    return ranks.filter(r => r.enabled).map(r => {
+      // main-matches probability
+      const pMain = r.mainMode === "exact"
+        ? hypergeomExact(nMain, mMain, mMain, r.mainExact)
+        : sumRange(r.mainMin ?? 0, r.mainMax ?? mMain, (k) => hypergeomExact(nMain, mMain, mMain, k));
+
+      // bonus-matches probability (if no bonus draws, treat as match 0 with prob=1)
+      const pBonus = mBonus > 0
+        ? (r.bonusMode === "exact"
+            ? hypergeomExact(nBonus, mBonus, mBonus, r.bonusExact)
+            : sumRange(r.bonusMin ?? 0, r.bonusMax ?? mBonus, (s) => hypergeomExact(nBonus, mBonus, mBonus, s)))
+        : (r.bonusMode === "exact" ? (r.bonusExact === 0 ? 1 : 0) : 1);
+
+      const p = pMain * pBonus; // independence between urns
+      const expectedWinners = N * p;
+      const probAtLeastOneWinner = 1 - Math.pow(1 - p, N);
+      // rank purse contribution to EV per ticket (pari-mutuel fixed purse to share)
+      const contributionPerTicket = (r.purseUsd * probAtLeastOneWinner) / N;
+      return { r, p, expectedWinners, probAtLeastOneWinner, contributionPerTicket };
+    });
+  }, [ranks, N, nMain, mMain, nBonus, mBonus]);
+
+  const evPurses = useMemo(() => perRank.reduce((s, x) => s + x.contributionPerTicket, 0), [perRank]);
+
+  const evAirdropPerTicket = useMemo(() => {
+    if (!weeklyAirdrop?.enabled) return 0;
+    const tokens = Math.max(0, Number(weeklyAirdrop.tokenAmount) || 0);
+    const price = Math.max(0, Number(weeklyAirdrop.tokenUsdPrice) || 0);
+    const total = tokens * price; // USD airdropped this week
+    const denom = Math.max(1, Number(weeklyAirdrop.weeklyTickets) || N);
+    return total / denom;
+  }, [weeklyAirdrop, N]);
+
+  const evPerTicket = evPurses + evAirdropPerTicket;
+  const evNetPerTicket = evPerTicket - ticketPrice;
+  const roi = evPerTicket / ticketPrice;
+
+  // Solve for break-even N* (ignoring airdrop or optionally include)
+  function breakEven(includeAirdrop) {
+    const maxN = 5_000_000; // search bound
+    const minN = 1;
+    function evAt(Nx) {
+      // recompute contributions at Nx (keeping per-rank p same because p depends on structure, not N)
+      let s = 0;
+      for (const x of perRank) {
+        const p = x.p;
+        const prob = 1 - Math.pow(1 - p, Nx);
+        s += (x.r.purseUsd * prob) / Nx;
+      }
+      if (includeAirdrop) {
+        const tokens = Math.max(0, Number(weeklyAirdrop.tokenAmount) || 0);
+        const price = Math.max(0, Number(weeklyAirdrop.tokenUsdPrice) || 0);
+        const total = tokens * price;
+        const denom = Math.max(1, Number(weeklyAirdrop.weeklyTickets) || Nx);
+        s += total / denom;
+      }
+      return s;
+    }
+    if (evAt(maxN) > model.ticketPrice) return null; // still EV+ within bounds
+    let lo = minN, hi = maxN;
+    while (hi - lo > 1) {
+      const mid = Math.floor((lo + hi) / 2);
+      const e = evAt(mid);
+      if (e > model.ticketPrice) lo = mid; else hi = mid;
+    }
+    return hi;
+  }
+
+  const nStarNoAirdrop = useMemo(() => breakEven(false), [perRank, weeklyAirdrop, model.ticketPrice]);
+  const nStarWithAirdrop = useMemo(() => breakEven(true), [perRank, weeklyAirdrop, model.ticketPrice]);
+
+  return { perRank, evPurses, evAirdropPerTicket, evPerTicket, evNetPerTicket, roi, nStarNoAirdrop, nStarWithAirdrop };
+}
+
+function NumberInput({ label, value, onChange, step = 1, min = 0, className = "" }) {
+  return (
+    <label className={`flex flex-col gap-1 ${className}`}>
+      <span className="text-xs text-slate-400">{label}</span>
+      <input type="number" step={step} min={min} value={value}
+        onChange={e => onChange(Number(e.target.value))}
+        className="px-3 py-2 rounded-xl bg-slate-800/60 border border-slate-700 text-slate-100 focus:outline-none" />
+    </label>
+  );
+}
+
+function Switch({ label, checked, onChange }) {
+  return (
+    <div className="flex items-center gap-3">
+      <button onClick={() => onChange(!checked)}
+        className={`w-12 h-7 rounded-full p-1 transition ${checked ? "bg-emerald-500/80" : "bg-slate-600"}`}>
+        <div className={`h-5 w-5 rounded-full bg-white transition ${checked ? "translate-x-5" : "translate-x-0"}`} />
+      </button>
+      <span className="text-sm text-slate-300">{label}</span>
+    </div>
+  );
+}
+
+function RankRow({ r, mMain, mBonus, onChange, onRemove }) {
+  const update = (patch) => onChange({ ...r, ...patch });
+  return (
+    <div className="grid grid-cols-12 gap-2 items-end p-3 rounded-2xl bg-slate-900/60 border border-slate-800">
+      <input className="col-span-2 px-3 py-2 rounded-xl bg-slate-800/60 border border-slate-700 text-slate-100"
+             value={r.name} onChange={e => update({ name: e.target.value })} />
+
+      <div className="col-span-3 grid grid-cols-3 gap-2">
+        <select value={r.mainMode} onChange={e => update({ mainMode: e.target.value })}
+          className="col-span-1 px-2 py-2 rounded-xl bg-slate-800/60 border border-slate-700 text-slate-100">
+          <option value="exact">main =</option>
+          <option value="range">main min..max</option>
+        </select>
+        {r.mainMode === "exact" ? (
+          <NumberInput className="col-span-2" label={`Main (0..${mMain})`} value={r.mainExact}
+            onChange={v => update({ mainExact: clamp(v, 0, mMain) })} />
+        ) : (
+          <>
+            <NumberInput label={`Main min`} value={r.mainMin ?? 0} onChange={v => update({ mainMin: clamp(v, 0, mMain) })} />
+            <NumberInput label={`Main max`} value={r.mainMax ?? mMain} onChange={v => update({ mainMax: clamp(v, 0, mMain) })} />
+          </>
+        )}
+      </div>
+
+      <div className="col-span-3 grid grid-cols-3 gap-2">
+        <select value={r.bonusMode} onChange={e => update({ bonusMode: e.target.value })}
+          className="col-span-1 px-2 py-2 rounded-xl bg-slate-800/60 border border-slate-700 text-slate-100">
+          <option value="exact">bonus =</option>
+          <option value="range">bonus min..max</option>
+        </select>
+        {r.bonusMode === "exact" ? (
+          <NumberInput className="col-span-2" label={`Bonus (0..${mBonus})`} value={r.bonusExact}
+            onChange={v => update({ bonusExact: clamp(v, 0, mBonus) })} />
+        ) : (
+          <>
+            <NumberInput label={`Bonus min`} value={r.bonusMin ?? 0} onChange={v => update({ bonusMin: clamp(v, 0, mBonus) })} />
+            <NumberInput label={`Bonus max`} value={r.bonusMax ?? mBonus} onChange={v => update({ bonusMax: clamp(v, 0, mBonus) })} />
+          </>
+        )}
+      </div>
+
+      <NumberInput className="col-span-2" label="Purse (USD)" value={r.purseUsd}
+        onChange={v => update({ purseUsd: Math.max(0, v) })} step={0.01} />
+
+      <div className="col-span-1 flex items-center justify-center">
+        <Switch label="" checked={r.enabled} onChange={(c) => update({ enabled: c })} />
+      </div>
+
+      <div className="col-span-1 flex justify-end">
+        <button className="px-3 py-2 rounded-xl bg-rose-700/70 hover:bg-rose-700 text-white" onClick={onRemove}>✕</button>
+      </div>
+    </div>
+  );
+}
+
+function LotteryEVApp() {
+  const [model, setModel] = useState(defaultModel);
+
+  const { perRank, evPurses, evAirdropPerTicket, evPerTicket, evNetPerTicket, roi, nStarNoAirdrop, nStarWithAirdrop } = useLottery(model);
+
+  const totalPurse = useMemo(() => model.ranks.filter(r => r.enabled).reduce((s, r) => s + r.purseUsd, 0), [model]);
+  const anyWinProb = useMemo(() => perRank.reduce((s, x) => s + x.p, 0), [perRank]);
+
+  function updateModel(patch) { setModel(m => ({ ...m, ...patch })); }
+
+  function addRank() {
+    const k = model.ranks.length;
+    const newRank = { id: `custom-${k+1}`, name: `Custom ${k+1}`, mainMode: "exact", mainExact: 2, bonusMode: "exact", bonusExact: 0, purseUsd: 1000, enabled: true };
+    updateModel({ ranks: [...model.ranks, newRank] });
+  }
+
+  function removeRank(idx) {
+    const arr = [...model.ranks];
+    arr.splice(idx, 1);
+    updateModel({ ranks: arr });
+  }
+
+  function updateRank(idx, newRank) {
+    const arr = [...model.ranks];
+    arr[idx] = newRank;
+    updateModel({ ranks: arr });
+  }
+
+  function exportConfig() {
+    const blob = new Blob([JSON.stringify(model, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "lottery-ev-config.json"; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function importConfig(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try { const obj = JSON.parse(String(reader.result)); setModel(obj); } catch (err) { alert("Invalid JSON"); }
+    };
+    reader.readAsText(file);
+  }
+
+  const airdropUsd = (model.weeklyAirdrop?.tokenAmount || 0) * (model.weeklyAirdrop?.tokenUsdPrice || 0);
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-slate-100 p-6">
+      <div className="max-w-7xl mx-auto space-y-6">
+        <header className="flex items-center justify-between">
+          <h1 className="text-2xl font-semibold">🎯 Lottery EV Calculator</h1>
+          <div className="flex gap-2">
+            <label className="text-sm px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 cursor-pointer">Import config JSON
+              <input type="file" className="hidden" accept="application/json" onChange={importConfig} />
+            </label>
+            <button className="text-sm px-3 py-2 rounded-xl bg-slate-900 border border-slate-700" onClick={exportConfig}>Export config</button>
+          </div>
+        </header>
+
+        {/* Top controls */}
+        <div className="grid md:grid-cols-3 gap-4">
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-3">
+            <h2 className="text-lg font-medium">🎟️ Ticket & volumes</h2>
+            <NumberInput label="Ticket price ($)" value={model.ticketPrice} onChange={(v) => updateModel({ ticketPrice: Math.max(0, v) })} step={0.0000001} />
+            <NumberInput label="Total tickets (N)" value={model.totalTickets} onChange={(v) => updateModel({ totalTickets: Math.max(1, Math.floor(v)) })} />
+            <div className="text-xs text-slate-400">Mise totale ≈ ${fmt(model.totalTickets * model.ticketPrice)}</div>
+          </div>
+
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-3">
+            <h2 className="text-lg font-medium">🔢 Draw structure</h2>
+            <div className="grid grid-cols-2 gap-3">
+              <NumberInput label="Main pool size (N)" value={model.main.poolSize} onChange={(v) => updateModel({ main: { ...model.main, poolSize: Math.max(1, Math.floor(v)) } })} />
+              <NumberInput label="Main draw count (k)" value={model.main.drawCount} onChange={(v) => updateModel({ main: { ...model.main, drawCount: Math.max(0, Math.floor(v)) } })} />
+              <NumberInput label="Bonus pool size (S)" value={model.bonus.poolSize} onChange={(v) => updateModel({ bonus: { ...model.bonus, poolSize: Math.max(0, Math.floor(v)) } })} />
+              <NumberInput label="Bonus draw count (B)" value={model.bonus.drawCount} onChange={(v) => updateModel({ bonus: { ...model.bonus, drawCount: Math.max(0, Math.floor(v)) } })} />
+            </div>
+            <p className="text-xs text-slate-400">Probas calculées avec hypergéométrique (tirage sans remise) pour les deux urnes.</p>
+          </div>
+
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-3">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-medium">🎁 Weekly airdrop</h2>
+              <Switch label="Enable" checked={model.weeklyAirdrop.enabled}
+                onChange={(c) => updateModel({ weeklyAirdrop: { ...model.weeklyAirdrop, enabled: c } })} />
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              <NumberInput label="Tokens" value={model.weeklyAirdrop.tokenAmount} onChange={(v) => updateModel({ weeklyAirdrop: { ...model.weeklyAirdrop, tokenAmount: Math.max(0, v) } })} />
+              <NumberInput label="Token price ($)" step={0.0001} value={model.weeklyAirdrop.tokenUsdPrice} onChange={(v) => updateModel({ weeklyAirdrop: { ...model.weeklyAirdrop, tokenUsdPrice: Math.max(0, v) } })} />
+              <NumberInput label="Weekly tickets (denom)" value={model.weeklyAirdrop.weeklyTickets} onChange={(v) => updateModel({ weeklyAirdrop: { ...model.weeklyAirdrop, weeklyTickets: Math.max(1, Math.floor(v)) } })} />
+            </div>
+            <div className="text-xs text-slate-400">Airdrop USD ≈ ${fmt(airdropUsd)} → +${fmt((model.weeklyAirdrop.enabled ? airdropUsd / Math.max(1, model.weeklyAirdrop.weeklyTickets) : 0), 6)} / ticket</div>
+          </div>
+        </div>
+
+        {/* Ranks editor */}
+        <section className="space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-medium">🏆 Prize ranks</h2>
+            <button className="px-3 py-2 rounded-xl bg-slate-900 border border-slate-700" onClick={addRank}>+ Add rank</button>
+          </div>
+          <div className="space-y-2">
+            {model.ranks.map((r, i) => (
+              <RankRow key={r.id} r={r} mMain={model.main.drawCount} mBonus={model.bonus.drawCount}
+                onChange={(nr) => updateRank(i, nr)} onRemove={() => removeRank(i)} />
+            ))}
+          </div>
+          <div className="text-xs text-slate-400">Purse = cagnotte fixe à partager (pari-mutuel). Décoche un rang pour l'exclure.
+          </div>
+        </section>
+
+        {/* Results */}
+        <section className="grid lg:grid-cols-3 gap-4">
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-2">
+            <h3 className="font-medium">📊 EV & ROI</h3>
+            <div className="text-sm">Prizepool actif (somme des rangs cochés): <b>${fmt(totalPurse)}</b></div>
+            <div className="text-sm">EV (purses) / ticket: <b>${fmt(evPurses, 6)}</b></div>
+            <div className="text-sm">EV (airdrop) / ticket: <b>${fmt(evAirdropPerTicket, 6)}</b></div>
+            <div className="text-sm">EV totale / ticket: <b>${fmt(evPerTicket, 6)}</b></div>
+            <div className="text-sm">EV nette / ticket: <b>${fmt(evNetPerTicket, 6)}</b></div>
+            <div className="text-sm">ROI (= EV / prix): <b>{fmt(roi, 4)}×</b></div>
+          </div>
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-2">
+            <h3 className="font-medium">⚖️ Break-even (EV = prix)</h3>
+            <div className="text-sm">Seuil tickets (hors airdrop): <b>{nStarNoAirdrop ? fmt0(nStarNoAirdrop) : ">5 000 000"}</b></div>
+            <div className="text-sm">Seuil tickets (avec airdrop): <b>{nStarWithAirdrop ? fmt0(nStarWithAirdrop) : ">5 000 000"}</b></div>
+            <div className="text-xs text-slate-400">Si la valeur du token/volume airdrop varie, ce seuil évolue.</div>
+          </div>
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-2">
+            <h3 className="font-medium">🎯 Probas par ticket</h3>
+            <div className="text-xs text-slate-400">P(au moins un prix) = somme des probas exactes des rangs actifs.</div>
+            <div className="text-sm">P(≥ 1 prix) ≈ <b>{fmt(anyWinProb * 100, 6)}%</b></div>
+          </div>
+        </section>
+
+        {/* Per-rank table */}
+        <section className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800">
+          <h3 className="font-medium mb-3">📈 Détails par rang (avec N = {fmt0(model.totalTickets)})</h3>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-slate-300 border-b border-slate-800">
+                  <th className="text-left py-2">Rang</th>
+                  <th className="text-right py-2">P(exacte)</th>
+                  <th className="text-right py-2">E[# gagnants]</th>
+                  <th className="text-right py-2">P(≥1 gagnant)</th>
+                  <th className="text-right py-2">Purse ($)</th>
+                  <th className="text-right py-2">Contrib. EV/ticket ($)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {perRank.map(({ r, p, expectedWinners, probAtLeastOneWinner, contributionPerTicket }) => (
+                  <tr key={r.id} className="border-b border-slate-800/60">
+                    <td className="py-2 text-slate-200">{r.name}</td>
+                    <td className="py-2 text-right">{fmt(p * 100, 6)}%</td>
+                    <td className="py-2 text-right">{fmt(expectedWinners, 4)}</td>
+                    <td className="py-2 text-right">{fmt(probAtLeastOneWinner * 100, 4)}%</td>
+                    <td className="py-2 text-right">${fmt(r.purseUsd)}</td>
+                    <td className="py-2 text-right">${fmt(contributionPerTicket, 6)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        {/* Utility notes */}
+        <section className="text-xs text-slate-400 space-y-1">
+          <p>🔌 <b>Live updates</b>: branche un fetch vers tes endpoints (prizepool, ventes, prix du $LUCKY). Par ex. programme un cron/serverless qui alimente un JSON public, puis charge-le ici pour mettre à jour le modèle.</p>
+          <p>🧩 <b>Types de tirage</b>: ajuste <i>Main/Bonus</i> (tailles d'urnes et nb de tirages) + configure les rangs (exact/range) pour modéliser d'autres loteries (ex. 6 numéros, 2 bonus, etc.).</p>
+          <p>🧮 <b>Formules</b>: Hypergéométrique pour chaque urne; indépendance entre urnes; EV pari-mutuel à cagnotte fixe partagée.</p>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+    ReactDOM.render(<LotteryEVApp />, document.getElementById('root'));
+  </script>
+</body>
+</html>
